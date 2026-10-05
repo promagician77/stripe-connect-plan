@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex, nofollow">
+<title>Stripe Connect payment microservice - technical plan</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%230F2A44'/><text x='32' y='44' text-anchor='middle' font-family='monospace' font-size='30' font-weight='700' fill='%2337C3A5'>€</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="hbar">
+    <div class="logo"><span class="mk">€</span> Payments microservice <small>Spring Boot · Stripe Connect</small></div>
+    <span class="by">Technical plan by James</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="model">Connect model</button>
+    <button role="tab" aria-selected="false" data-tab="money">Money ledger</button>
+    <button role="tab" aria-selected="false" data-tab="hooks">Webhooks</button>
+    <button role="tab" aria-selected="false" data-tab="arch">Architecture</button>
+    <button role="tab" aria-selected="false" data-tab="scope">Scope &amp; quote</button>
+  </nav>
+</header>
+
+<!-- ============ CONNECT MODEL ============ -->
+<section id="model" class="panel">
+  <div class="row">
+    <div class="card qs">
+      <h3>Answer two questions</h3>
+      <div class="q">
+        <p>Who is the merchant of record?</p>
+        <div class="seg" data-q="mor"><button data-v="seller" aria-pressed="true">Seller</button><button data-v="platform" aria-pressed="false">Platform</button></div>
+        <small>Name on the card statement, liable for refunds and disputes.</small>
+      </div>
+      <div class="q">
+        <p>Can one cart contain several sellers?</p>
+        <div class="seg" data-q="multi"><button data-v="no" aria-pressed="true">No</button><button data-v="yes" aria-pressed="false">Yes</button></div>
+        <small>One checkout paying two or more shops.</small>
+      </div>
+      <div class="your">Your brief: <b>seller collects, platform takes a commission</b> → Seller + No.</div>
+    </div>
+    <div class="card wide">
+      <div class="verdict" id="verdict"></div>
+      <svg id="flow" viewBox="0 0 760 300" role="img" aria-label="Fund flow"></svg>
+      <div class="facts" id="facts"></div>
+    </div>
+  </div>
+  <div class="row3">
+    <div class="card mcard" data-m="direct"><h4>Direct charges</h4><ul><li>Charge created on the seller's account</li><li>Seller pays Stripe fee</li><li>Platform earns <code>application_fee_amount</code></li><li>Disputes hit the seller first</li></ul></div>
+    <div class="card mcard" data-m="destination"><h4>Destination charges</h4><ul><li>Charge on the platform, <code>transfer_data.destination</code></li><li>Platform pays Stripe fee</li><li>Seller receives gross minus fee</li><li>Disputes hit the platform</li></ul></div>
+    <div class="card mcard" data-m="sct"><h4>Separate charges &amp; transfers</h4><ul><li>Platform charges once, transfers per seller</li><li>Linked by <code>transfer_group</code> / <code>source_transaction</code></li><li>Only model that splits one cart</li><li>Platform pays Stripe fee and handles disputes</li></ul></div>
+  </div>
+</section>
+
+<!-- ============ MONEY LEDGER ============ -->
+<section id="money" class="panel" hidden>
+  <div class="row">
+    <div class="card qs">
+      <h3>Order</h3>
+      <label>Gross amount (€)<input type="number" id="m-gross" value="150" min="1" step="0.01"></label>
+      <label>Platform commission (%) <small>from your financial engine</small><input type="number" id="m-comm" value="8" min="0" max="50" step="0.5"></label>
+      <label>Stripe fee <small>example EEA card rate</small>
+        <div class="two"><input type="number" id="m-fp" value="1.5" step="0.1" aria-label="Percent"><input type="number" id="m-ff" value="0.25" step="0.01" aria-label="Fixed"></div></label>
+      <label>Model<select id="m-model"><option value="direct">Direct charge</option><option value="destination">Destination charge</option><option value="sct">Separate charges &amp; transfers (2 sellers)</option></select></label>
+      <p class="note">In production the Stripe fee is never computed. It's read from the balance transaction.</p>
+    </div>
+    <div class="card wide">
+      <h3>The five amounts, stored per payment</h3>
+      <div class="five" id="five"></div>
+      <h3 style="margin-top:20px">Who ends up with what</h3>
+      <div class="parties" id="parties"></div>
+      <div class="trap" id="trap"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WEBHOOKS ============ -->
+<section id="hooks" class="panel" hidden>
+  <div class="row">
+    <div class="card qs">
+      <h3>Send events to the service</h3>
+      <div class="evbtns">
+        <button data-ev="payment_intent.requires_action">requires_action (3DS)</button>
+        <button data-ev="payment_intent.succeeded">payment_intent.succeeded</button>
+        <button data-ev="charge.refunded:partial">charge.refunded (€50)</button>
+        <button data-ev="charge.refunded:full">charge.refunded (rest)</button>
+        <button data-ev="charge.dispute.created">charge.dispute.created</button>
+        <button data-ev="payout.paid">payout.paid (Connect)</button>
+      </div>
+      <h3 style="margin-top:16px">Things that go wrong in production</h3>
+      <div class="evbtns bad">
+        <button data-ev="dup">Stripe retries the last event</button>
+        <button data-ev="late">Old event arrives late</button>
+        <button data-ev="badsig">Request with a bad signature</button>
+      </div>
+      <button class="reset" id="h-reset">Reset</button>
+    </div>
+    <div class="card wide">
+      <div class="statebar"><span>Payment <code>pay_7Q2</code> · €150.00</span><b id="h-state" class="st">CREATED</b></div>
+      <div class="flowline" id="h-path"></div>
+      <div class="tw"><table class="evt"><thead><tr><th>Event ID</th><th>Type</th><th>Account</th><th>Result</th></tr></thead><tbody id="h-log"><tr><td colspan="4" class="muted">Events appear here as the service receives them.</td></tr></tbody></table></div>
+      <div class="rules">
+        <div><b>Raw body</b>Signature checked on the exact bytes Stripe sent. Parsing the JSON first breaks verification.</div>
+        <div><b>Unique event ID</b>Stored before processing. A retry hits the unique constraint and is acknowledged with 200.</div>
+        <div><b>Forward-only states</b>A late <code>requires_action</code> can't pull a PAID payment backwards.</div>
+        <div><b>Fast 200</b>Store, then process asynchronously, so Stripe never times out and retries.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ARCHITECTURE ============ -->
+<section id="arch" class="panel" hidden>
+  <div class="card full">
+    <h3>Stripe stays behind one adapter</h3>
+    <svg class="diag" viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg">
+      <defs><marker id="ar" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0L8 3L0 6" fill="#0F2A44"/></marker></defs>
+      <g font-family="Inter,sans-serif" font-size="13">
+        <rect x="10" y="40" width="170" height="70" rx="8" fill="#EEF4FA" stroke="#9DB4CC"/><text x="95" y="70" text-anchor="middle" font-weight="600">Financial engine</text><text x="95" y="90" text-anchor="middle" font-size="11" fill="#55667A">commission, allocations</text>
+        <rect x="10" y="180" width="170" height="70" rx="8" fill="#EEF4FA" stroke="#9DB4CC"/><text x="95" y="210" text-anchor="middle" font-weight="600">Angular / e-commerce</text><text x="95" y="230" text-anchor="middle" font-size="11" fill="#55667A">order, checkout</text>
+        <rect x="240" y="100" width="190" height="90" rx="8" fill="#fff" stroke="#0F2A44" stroke-width="1.5"/><text x="335" y="132" text-anchor="middle" font-weight="600">REST contract</text><text x="335" y="152" text-anchor="middle" font-size="11" fill="#55667A">POST /payments, /refund, /cancel</text><text x="335" y="170" text-anchor="middle" font-size="11" fill="#55667A">provider-agnostic</text>
+        <rect x="480" y="100" width="190" height="90" rx="8" fill="#E8F8F4" stroke="#37C3A5" stroke-width="1.5"/><text x="575" y="132" text-anchor="middle" font-weight="600">PaymentService</text><text x="575" y="152" text-anchor="middle" font-size="11" fill="#55667A">state machine, ledger,</text><text x="575" y="170" text-anchor="middle" font-size="11" fill="#55667A">idempotency keys</text>
+        <rect x="720" y="40" width="260" height="70" rx="8" fill="#fff" stroke="#0F2A44"/><text x="850" y="68" text-anchor="middle" font-weight="600">PaymentProvider (port)</text><text x="850" y="88" text-anchor="middle" font-size="11" fill="#55667A">create · capture · cancel · refund · onboard</text>
+        <rect x="720" y="130" width="260" height="50" rx="8" fill="#F4F0FF" stroke="#8B7CF6"/><text x="850" y="160" text-anchor="middle" font-weight="600">StripeConnectAdapter</text>
+        <rect x="720" y="200" width="260" height="50" rx="8" fill="#fff" stroke="#C7CFD8" stroke-dasharray="5 4"/><text x="850" y="230" text-anchor="middle" fill="#8995A3">Future adapter (Adyen, Nexi...)</text>
+        <rect x="480" y="230" width="190" height="56" rx="8" fill="#FFF6E8" stroke="#F0B35A"/><text x="575" y="254" text-anchor="middle" font-weight="600">Webhook inbox</text><text x="575" y="272" text-anchor="middle" font-size="11" fill="#55667A">platform + Connect endpoints</text>
+        <path d="M180 75 L240 130" stroke="#0F2A44" marker-end="url(#ar)"/><path d="M180 215 L240 165" stroke="#0F2A44" marker-end="url(#ar)"/>
+        <path d="M430 145 L480 145" stroke="#0F2A44" marker-end="url(#ar)"/><path d="M670 125 L720 80" stroke="#0F2A44" marker-end="url(#ar)"/>
+        <path d="M850 110 L850 130" stroke="#0F2A44" marker-end="url(#ar)"/><path d="M850 180 L850 200" stroke="#C7CFD8" stroke-dasharray="4 3"/>
+        <path d="M720 160 C 690 200, 690 240, 670 255" stroke="#F0B35A" marker-end="url(#ar)"/><text x="690" y="215" font-size="11" fill="#A06A1A">events</text>
+        <path d="M575 230 L575 190" stroke="#F0B35A" marker-end="url(#ar)"/>
+        <path d="M480 160 C 300 260, 220 120, 180 95" stroke="#37C3A5" stroke-dasharray="5 4" marker-end="url(#ar)"/><text x="300" y="255" font-size="11" fill="#1E8A72">status + economic event ID back</text>
+      </g>
+    </svg>
+  </div>
+  <div class="row2">
+    <div class="card"><h4>Direct charge on the seller's account</h4><pre><code><span class="c">// Commission comes from your financial engine - no rules here</span>
+RequestOptions opts = RequestOptions.builder()
+    .setStripeAccount(cmd.connectedAccountId())
+    .setIdempotencyKey(<span class="s">"pay-"</span> + cmd.internalPaymentId())
+    .build();
+
+PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
+    .setAmount(cmd.grossAmount())
+    .setCurrency(cmd.currency())
+    .setApplicationFeeAmount(cmd.platformCommission())
+    .setAutomaticPaymentMethods(
+        PaymentIntentCreateParams.AutomaticPaymentMethods.builder()
+            .setEnabled(<span class="k">true</span>).build())
+    .putMetadata(<span class="s">"internal_payment_id"</span>, cmd.internalPaymentId())
+    .putMetadata(<span class="s">"economic_event_id"</span>, cmd.economicEventId())
+    .build();
+
+PaymentIntent pi = PaymentIntent.create(params, opts);</code></pre></div>
+    <div class="card"><h4>The real Stripe cost, not the fee field</h4><pre><code>Charge charge = Charge.retrieve(chargeId,
+    ChargeRetrieveParams.builder()
+        .addExpand(<span class="s">"balance_transaction"</span>).build(),
+    opts);
+
+BalanceTransaction bt = charge.getBalanceTransactionObject();
+
+<span class="c">// bt.getFee() = stripe_fee + application_fee on a direct charge.</span>
+<span class="c">// Storing it as "Stripe cost" double-counts your commission.</span>
+<span class="k">long</span> stripeCost = bt.getFeeDetails().stream()
+    .filter(f -&gt; <span class="s">"stripe_fee"</span>.equals(f.getType()))
+    .mapToLong(BalanceTransaction.FeeDetail::getAmount)
+    .sum();</code></pre></div>
+    <div class="card"><h4>Partial refund that also returns the commission</h4><pre><code>RefundCreateParams params = RefundCreateParams.builder()
+    .setPaymentIntent(payment.getPaymentIntentId())
+    .setAmount(cmd.amount())                       <span class="c">// partial or full</span>
+    .setRefundApplicationFee(cmd.refundCommission()) <span class="c">// your engine decides</span>
+    .build();
+<span class="c">// Destination / SCT: also .setReverseTransfer(true)</span>
+
+Refund refund = Refund.create(params, opts);   <span class="c">// idempotency key per refund</span></code></pre></div>
+    <div class="card"><h4>Connect webhook: raw body, verify, store, 200</h4><pre><code>@PostMapping(<span class="s">"/webhooks/stripe/connect"</span>)
+ResponseEntity&lt;Void&gt; connect(@RequestBody String payload,
+        @RequestHeader(<span class="s">"Stripe-Signature"</span>) String sig) {
+    Event event;
+    <span class="k">try</span> {
+        event = Webhook.constructEvent(payload, sig, connectSecret);
+    } <span class="k">catch</span> (SignatureVerificationException e) {
+        <span class="k">return</span> ResponseEntity.badRequest().build();
+    }
+    <span class="k">if</span> (!inbox.insertIfAbsent(event.getId(), event.getAccount(),
+                              event.getType(), payload)) {
+        <span class="k">return</span> ResponseEntity.ok().build();   <span class="c">// duplicate delivery</span>
+    }
+    processor.enqueue(event.getId());           <span class="c">// async</span>
+    <span class="k">return</span> ResponseEntity.ok().build();
+}</code></pre></div>
+  </div>
+  <div class="card full">
+    <h3>payment table</h3>
+    <div class="cols" id="cols"></div>
+  </div>
+</section>
+
+<!-- ============ SCOPE & QUOTE ============ -->
+<section id="scope" class="panel" hidden>
+  <div class="row2">
+    <div class="card">
+      <h3>Included</h3>
+      <ul class="inc">
+        <li>PaymentIntent create, confirm, capture, cancel</li>
+        <li>Connected Account onboarding links and status / capabilities check</li>
+        <li>Direct, destination, and separate charges &amp; transfers, chosen per payment</li>
+        <li>Application fee from the request, never hard-coded</li>
+        <li>Full and partial refunds, with commission refund and transfer reversal</li>
+        <li>Platform and Connect webhooks, signature check, event inbox, dedupe</li>
+        <li>3DS / requires_action and failed payment handling</li>
+        <li>Dispute events and Connected Account payout tracking</li>
+        <li>Real Stripe cost from balance transactions, five amounts per payment</li>
+        <li>Test / production separation, keys from environment</li>
+        <li>OpenAPI / Swagger, centralized error handling</li>
+        <li>Unit and integration tests against Stripe test mode</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Excluded</h3>
+      <ul class="exc">
+        <li>Frontend / Angular changes</li>
+        <li>Providers other than Stripe (adapter port ready)</li>
+        <li>Stripe fees and account approval</li>
+        <li>Financial engine rules (commission, royalties, referrals)</li>
+        <li>Hosting and production server setup</li>
+        <li>Tax, legal, or compliance advice</li>
+      </ul>
+      <h3 style="margin-top:22px">15 working days · $3,900</h3>
+      <div class="ms">
+        <div><span>40%</span><b>$1,560</b><p>Days 1-5 · architecture, schema, PaymentIntent, Connect onboarding and status</p></div>
+        <div><span>30%</span><b>$1,170</b><p>Days 6-10 · webhooks, refunds, cancel/capture, disputes, payouts · beta</p></div>
+        <div><span>30%</span><b>$1,170</b><p>Days 11-15 · fee reconciliation, OpenAPI, tests, documentation</p></div>
+      </div>
+      <p class="note">Same 40 / 30 / 30 split and 30-day warranty as your document.</p>
+    </div>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
